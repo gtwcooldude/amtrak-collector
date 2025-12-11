@@ -3,3 +3,4 @@ psycopg[binary]==3.2.3
 gtfs-realtime-bindings==1.0.0
 protobuf==4.25.1
 flask==3.0.0
+flask-cors==4.0.0
