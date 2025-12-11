@@ -1,4 +1,0 @@
-psycopg2-binary==2.9.9
-gtfs-realtime-bindings==1.0.0
-protobuf==4.25.1
-flask==3.0.0
