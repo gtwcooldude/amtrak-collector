@@ -13,6 +13,7 @@ from datetime import datetime
 from urllib.request import urlopen, Request
 from urllib.error import URLError, HTTPError
 import threading
+from flask_cors import CORS
 
 # Database - psycopg v3
 import psycopg
@@ -388,6 +389,7 @@ def cleanup_loop():
 # FLASK SERVER
 # =============================================================================
 app = Flask(__name__)
+CORS(app) 
 
 @app.route('/')
 def home():
