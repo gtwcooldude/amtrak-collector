@@ -1,1 +1,1 @@
-web: python amtrak_collector.py
+web: gunicorn railway_collector:app
