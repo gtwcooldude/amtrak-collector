@@ -81,6 +81,23 @@ def init_database():
                     )
                 """)
                 
+                # Add missing columns if table already existed
+                columns_to_add = [
+                    ("moving", "INTEGER"),
+                    ("stopped", "INTEGER"),
+                    ("delayed", "INTEGER"),
+                    ("avg_speed", "FLOAT"),
+                    ("max_speed", "FLOAT"),
+                    ("oee", "FLOAT"),
+                    ("on_time_pct", "FLOAT")
+                ]
+                
+                for col_name, col_type in columns_to_add:
+                    try:
+                        cur.execute(f"ALTER TABLE kpi_snapshots ADD COLUMN IF NOT EXISTS {col_name} {col_type}")
+                    except Exception:
+                        pass  # Column might already exist
+                
                 # Train positions table - stores individual train data
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS train_positions (
