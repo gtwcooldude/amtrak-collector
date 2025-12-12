@@ -1,12 +1,20 @@
 """
-Amtrak Real-Time Data Collector - Production v4.0
+Amtrak Real-Time Data Collector v5.0
+=====================================
+Features:
+- Time-of-day analysis (peak/off-peak, weekday/weekend)
+- Weather correlation (OpenWeather API)
+- Incident annotations
+- Station-level metrics
+- Hourly/daily rollups
+- Route performance tracking
 """
 
 import os
 import time
 import logging
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 import requests
@@ -21,18 +29,33 @@ logger = logging.getLogger("AmtrakCollector")
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
 
+# Configuration
 AMTRAKER_API = "https://api-v3.amtraker.com/v3"
 COLLECTION_INTERVAL = 30
 RAW_RETENTION_DAYS = 7
 AGGREGATION_INTERVAL = 3600
+WEATHER_INTERVAL = 900  # 15 minutes
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
+OPENWEATHER_API_KEY = os.environ.get("OPENWEATHER_API_KEY")
 
+# Key cities for weather (covers major Amtrak corridors)
+WEATHER_CITIES = [
+    {"name": "New York", "lat": 40.7128, "lon": -74.0060},
+    {"name": "Chicago", "lat": 41.8781, "lon": -87.6298},
+    {"name": "Los Angeles", "lat": 34.0522, "lon": -118.2437},
+    {"name": "Washington DC", "lat": 38.9072, "lon": -77.0369},
+    {"name": "Boston", "lat": 42.3601, "lon": -71.0589},
+]
+
+# In-memory cache
 latest_cache = {
     "trains": [],
     "timestamp": None,
     "kpi": None,
-    "routes": {}
+    "routes": {},
+    "weather": {},
+    "stations": {}
 }
 
 collection_stats = {
@@ -41,7 +64,8 @@ collection_stats = {
     "successful_saves": 0,
     "failed_saves": 0,
     "last_error": None,
-    "last_aggregation": None
+    "last_aggregation": None,
+    "last_weather_fetch": None
 }
 
 
@@ -64,6 +88,7 @@ def init_database():
     try:
         with get_db_connection() as conn:
             with conn.cursor() as cur:
+                # Core KPI snapshots
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS kpi_snapshots (
                         id SERIAL PRIMARY KEY,
@@ -75,19 +100,28 @@ def init_database():
                         avg_speed FLOAT,
                         max_speed FLOAT,
                         oee FLOAT,
-                        on_time_pct FLOAT
+                        on_time_pct FLOAT,
+                        hour_of_day INTEGER,
+                        day_of_week INTEGER,
+                        is_weekend BOOLEAN
                     )
                 """)
                 
-                for col, ctype in [("moving", "INTEGER"), ("stopped", "INTEGER"), 
-                                   ("delayed", "INTEGER"), ("avg_speed", "FLOAT"),
-                                   ("max_speed", "FLOAT"), ("oee", "FLOAT"), 
-                                   ("on_time_pct", "FLOAT")]:
+                # Add new columns if table exists
+                new_cols = [
+                    ("moving", "INTEGER"), ("stopped", "INTEGER"), 
+                    ("delayed", "INTEGER"), ("avg_speed", "FLOAT"),
+                    ("max_speed", "FLOAT"), ("oee", "FLOAT"), 
+                    ("on_time_pct", "FLOAT"), ("hour_of_day", "INTEGER"),
+                    ("day_of_week", "INTEGER"), ("is_weekend", "BOOLEAN")
+                ]
+                for col, ctype in new_cols:
                     try:
                         cur.execute(f"ALTER TABLE kpi_snapshots ADD COLUMN IF NOT EXISTS {col} {ctype}")
                     except Exception:
                         pass
                 
+                # Route snapshots
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS route_snapshots (
                         id SERIAL PRIMARY KEY,
@@ -103,10 +137,62 @@ def init_database():
                     )
                 """)
                 
+                # Station metrics
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS station_snapshots (
+                        id SERIAL PRIMARY KEY,
+                        snapshot_id INTEGER REFERENCES kpi_snapshots(id) ON DELETE CASCADE,
+                        station_name VARCHAR(200),
+                        station_type VARCHAR(20),
+                        train_count INTEGER,
+                        avg_delay FLOAT,
+                        max_delay INTEGER,
+                        on_time_count INTEGER
+                    )
+                """)
+                
+                # Weather data
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS weather_snapshots (
+                        id SERIAL PRIMARY KEY,
+                        timestamp TIMESTAMPTZ DEFAULT NOW(),
+                        city VARCHAR(50),
+                        temp_f FLOAT,
+                        feels_like_f FLOAT,
+                        humidity INTEGER,
+                        wind_mph FLOAT,
+                        conditions VARCHAR(100),
+                        precipitation FLOAT,
+                        snow FLOAT,
+                        visibility FLOAT,
+                        is_severe BOOLEAN DEFAULT FALSE
+                    )
+                """)
+                
+                # Incidents/Annotations
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS incidents (
+                        id SERIAL PRIMARY KEY,
+                        timestamp TIMESTAMPTZ DEFAULT NOW(),
+                        end_timestamp TIMESTAMPTZ,
+                        title VARCHAR(200) NOT NULL,
+                        description TEXT,
+                        severity VARCHAR(20) DEFAULT 'info',
+                        affected_routes TEXT[],
+                        affected_stations TEXT[],
+                        source VARCHAR(100),
+                        is_active BOOLEAN DEFAULT TRUE
+                    )
+                """)
+                
+                # Hourly aggregations
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS kpi_hourly (
                         id SERIAL PRIMARY KEY,
                         hour_start TIMESTAMPTZ UNIQUE,
+                        hour_of_day INTEGER,
+                        day_of_week INTEGER,
+                        is_weekend BOOLEAN,
                         sample_count INTEGER,
                         avg_trains FLOAT,
                         min_trains INTEGER,
@@ -120,14 +206,28 @@ def init_database():
                         avg_oee FLOAT,
                         min_oee FLOAT,
                         max_oee FLOAT,
-                        avg_on_time_pct FLOAT
+                        avg_on_time_pct FLOAT,
+                        avg_temp_f FLOAT,
+                        conditions VARCHAR(100)
                     )
                 """)
                 
+                # Add new columns to hourly
+                hourly_cols = [("hour_of_day", "INTEGER"), ("day_of_week", "INTEGER"), 
+                              ("is_weekend", "BOOLEAN"), ("avg_temp_f", "FLOAT"), ("conditions", "VARCHAR(100)")]
+                for col, ctype in hourly_cols:
+                    try:
+                        cur.execute(f"ALTER TABLE kpi_hourly ADD COLUMN IF NOT EXISTS {col} {ctype}")
+                    except Exception:
+                        pass
+                
+                # Daily aggregations
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS kpi_daily (
                         id SERIAL PRIMARY KEY,
                         date DATE UNIQUE,
+                        day_of_week INTEGER,
+                        is_weekend BOOLEAN,
                         sample_count INTEGER,
                         avg_trains FLOAT,
                         min_trains INTEGER,
@@ -138,10 +238,22 @@ def init_database():
                         max_oee FLOAT,
                         avg_on_time_pct FLOAT,
                         peak_hour INTEGER,
-                        peak_trains INTEGER
+                        peak_trains INTEGER,
+                        avg_temp_f FLOAT,
+                        had_severe_weather BOOLEAN
                     )
                 """)
                 
+                # Add new columns to daily
+                daily_cols = [("day_of_week", "INTEGER"), ("is_weekend", "BOOLEAN"),
+                             ("avg_temp_f", "FLOAT"), ("had_severe_weather", "BOOLEAN")]
+                for col, ctype in daily_cols:
+                    try:
+                        cur.execute(f"ALTER TABLE kpi_daily ADD COLUMN IF NOT EXISTS {col} {ctype}")
+                    except Exception:
+                        pass
+                
+                # Route daily
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS route_daily (
                         id SERIAL PRIMARY KEY,
@@ -158,11 +270,51 @@ def init_database():
                     )
                 """)
                 
+                # Station daily
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS station_daily (
+                        id SERIAL PRIMARY KEY,
+                        date DATE,
+                        station_name VARCHAR(200),
+                        total_trains INTEGER,
+                        avg_delay FLOAT,
+                        max_delay INTEGER,
+                        on_time_pct FLOAT,
+                        delay_score FLOAT,
+                        UNIQUE(date, station_name)
+                    )
+                """)
+                
+                # Time-of-day patterns (aggregated by hour across all days)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS time_patterns (
+                        id SERIAL PRIMARY KEY,
+                        hour_of_day INTEGER,
+                        day_type VARCHAR(20),
+                        sample_days INTEGER,
+                        avg_trains FLOAT,
+                        avg_oee FLOAT,
+                        avg_on_time_pct FLOAT,
+                        avg_speed FLOAT,
+                        updated_at TIMESTAMPTZ DEFAULT NOW(),
+                        UNIQUE(hour_of_day, day_type)
+                    )
+                """)
+                
+                # Indexes
                 cur.execute("CREATE INDEX IF NOT EXISTS idx_kpi_timestamp ON kpi_snapshots(timestamp DESC)")
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_kpi_hour ON kpi_snapshots(hour_of_day)")
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_kpi_dow ON kpi_snapshots(day_of_week)")
                 cur.execute("CREATE INDEX IF NOT EXISTS idx_route_snapshot ON route_snapshots(snapshot_id)")
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_station_snapshot ON station_snapshots(snapshot_id)")
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_weather_time ON weather_snapshots(timestamp DESC)")
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_weather_city ON weather_snapshots(city)")
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_incidents_time ON incidents(timestamp DESC)")
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_incidents_active ON incidents(is_active)")
                 cur.execute("CREATE INDEX IF NOT EXISTS idx_hourly_time ON kpi_hourly(hour_start DESC)")
                 cur.execute("CREATE INDEX IF NOT EXISTS idx_daily_date ON kpi_daily(date DESC)")
                 cur.execute("CREATE INDEX IF NOT EXISTS idx_route_daily ON route_daily(date DESC, route_name)")
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_station_daily ON station_daily(date DESC, station_name)")
                 
                 conn.commit()
                 logger.info("Database initialized successfully")
@@ -172,143 +324,111 @@ def init_database():
         return False
 
 
-def save_snapshot(kpi, route_metrics):
+# =============================================================================
+# WEATHER FUNCTIONS
+# =============================================================================
+
+def fetch_weather():
+    """Fetch weather for key cities."""
+    if not OPENWEATHER_API_KEY:
+        return {}
+    
+    weather_data = {}
+    for city in WEATHER_CITIES:
+        try:
+            url = f"https://api.openweathermap.org/data/2.5/weather"
+            params = {
+                "lat": city["lat"],
+                "lon": city["lon"],
+                "appid": OPENWEATHER_API_KEY,
+                "units": "imperial"
+            }
+            resp = requests.get(url, params=params, timeout=10)
+            if resp.status_code == 200:
+                data = resp.json()
+                weather_data[city["name"]] = {
+                    "temp_f": data["main"]["temp"],
+                    "feels_like_f": data["main"]["feels_like"],
+                    "humidity": data["main"]["humidity"],
+                    "wind_mph": data["wind"]["speed"],
+                    "conditions": data["weather"][0]["main"] if data.get("weather") else "Unknown",
+                    "description": data["weather"][0]["description"] if data.get("weather") else "",
+                    "precipitation": data.get("rain", {}).get("1h", 0),
+                    "snow": data.get("snow", {}).get("1h", 0),
+                    "visibility": data.get("visibility", 10000) / 1609.34,  # meters to miles
+                    "is_severe": data["weather"][0]["main"] in ["Thunderstorm", "Snow", "Extreme"] if data.get("weather") else False
+                }
+        except Exception as e:
+            logger.error(f"Weather fetch error for {city['name']}: {e}")
+    
+    return weather_data
+
+
+def save_weather(weather_data):
+    """Save weather data to database."""
+    if not weather_data:
+        return
+    
     try:
         with get_db_connection() as conn:
             with conn.cursor() as cur:
-                cur.execute("""
-                    INSERT INTO kpi_snapshots 
-                    (total_trains, moving, stopped, delayed, avg_speed, max_speed, oee, on_time_pct)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                    RETURNING id
-                """, (
-                    kpi["total_trains"], kpi["moving"], kpi["stopped"], kpi["delayed"],
-                    kpi["avg_speed"], kpi["max_speed"], kpi["oee"], kpi["on_time_pct"]
-                ))
-                snapshot_id = cur.fetchone()[0]
-                
-                for route_name, metrics in route_metrics.items():
+                for city, data in weather_data.items():
                     cur.execute("""
-                        INSERT INTO route_snapshots
-                        (snapshot_id, route_name, train_count, avg_speed, max_speed, 
-                         delayed_count, on_time_pct, avg_delay, headway_minutes)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        INSERT INTO weather_snapshots 
+                        (city, temp_f, feels_like_f, humidity, wind_mph, conditions, 
+                         precipitation, snow, visibility, is_severe)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     """, (
-                        snapshot_id, route_name, metrics["count"], metrics["avg_speed"],
-                        metrics["max_speed"], metrics["delayed"], metrics["on_time_pct"],
-                        metrics["avg_delay"], metrics.get("headway")
+                        city, data["temp_f"], data["feels_like_f"], data["humidity"],
+                        data["wind_mph"], data["conditions"], data["precipitation"],
+                        data["snow"], data["visibility"], data["is_severe"]
                     ))
-                
                 conn.commit()
-                collection_stats["successful_saves"] += 1
-                return snapshot_id
     except Exception as e:
-        logger.error(f"Save error: {e}")
-        collection_stats["failed_saves"] += 1
-        collection_stats["last_error"] = str(e)
-        return None
+        logger.error(f"Weather save error: {e}")
 
 
-def run_hourly_aggregation():
-    try:
-        with get_db_connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    INSERT INTO kpi_hourly (
-                        hour_start, sample_count, avg_trains, min_trains, max_trains,
-                        avg_moving, avg_stopped, avg_delayed, avg_speed, min_speed, max_speed,
-                        avg_oee, min_oee, max_oee, avg_on_time_pct
-                    )
-                    SELECT 
-                        date_trunc('hour', timestamp) as hour_start,
-                        COUNT(*), AVG(total_trains), MIN(total_trains), MAX(total_trains),
-                        AVG(moving), AVG(stopped), AVG(delayed),
-                        AVG(avg_speed), MIN(avg_speed), MAX(avg_speed),
-                        AVG(oee), MIN(oee), MAX(oee), AVG(on_time_pct)
-                    FROM kpi_snapshots
-                    WHERE timestamp >= NOW() - INTERVAL '2 hours'
-                      AND timestamp < date_trunc('hour', NOW())
-                    GROUP BY date_trunc('hour', timestamp)
-                    ON CONFLICT (hour_start) DO UPDATE SET
-                        sample_count = EXCLUDED.sample_count,
-                        avg_oee = EXCLUDED.avg_oee
-                """)
-                
-                cur.execute("""
-                    INSERT INTO kpi_daily (
-                        date, sample_count, avg_trains, min_trains, max_trains,
-                        avg_speed, avg_oee, min_oee, max_oee, avg_on_time_pct,
-                        peak_hour, peak_trains
-                    )
-                    SELECT 
-                        date_trunc('day', hour_start)::date,
-                        SUM(sample_count), AVG(avg_trains), MIN(min_trains), MAX(max_trains),
-                        AVG(avg_speed), AVG(avg_oee), MIN(min_oee), MAX(max_oee),
-                        AVG(avg_on_time_pct), 0, MAX(max_trains)
-                    FROM kpi_hourly
-                    WHERE hour_start >= NOW() - INTERVAL '2 days'
-                      AND hour_start < date_trunc('day', NOW())
-                    GROUP BY date_trunc('day', hour_start)::date
-                    ON CONFLICT (date) DO UPDATE SET
-                        sample_count = EXCLUDED.sample_count,
-                        avg_oee = EXCLUDED.avg_oee
-                """)
-                
-                cur.execute("""
-                    INSERT INTO route_daily (
-                        date, route_name, sample_count, avg_trains, avg_speed,
-                        avg_delay, on_time_pct, avg_headway, reliability_score
-                    )
-                    SELECT 
-                        date_trunc('day', k.timestamp)::date,
-                        r.route_name, COUNT(*), AVG(r.train_count), AVG(r.avg_speed),
-                        AVG(r.avg_delay), AVG(r.on_time_pct), AVG(r.headway_minutes),
-                        (AVG(r.on_time_pct) * 0.4 + 
-                         (100 - LEAST(AVG(ABS(r.avg_delay)), 30) * 3.33) * 0.3 + 
-                         LEAST(AVG(r.avg_speed) / 60 * 100, 100) * 0.3)
-                    FROM route_snapshots r
-                    JOIN kpi_snapshots k ON r.snapshot_id = k.id
-                    WHERE k.timestamp >= NOW() - INTERVAL '2 days'
-                      AND k.timestamp < date_trunc('day', NOW())
-                    GROUP BY date_trunc('day', k.timestamp)::date, r.route_name
-                    ON CONFLICT (date, route_name) DO UPDATE SET
-                        sample_count = EXCLUDED.sample_count,
-                        reliability_score = EXCLUDED.reliability_score
-                """)
-                
-                conn.commit()
-                collection_stats["last_aggregation"] = datetime.utcnow().isoformat()
-                logger.info("Aggregation completed")
-    except Exception as e:
-        logger.error(f"Aggregation error: {e}")
+# =============================================================================
+# DATA COLLECTION
+# =============================================================================
 
-
-def cleanup_old_data():
-    try:
-        with get_db_connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    DELETE FROM route_snapshots 
-                    WHERE snapshot_id IN (
-                        SELECT id FROM kpi_snapshots 
-                        WHERE timestamp < NOW() - INTERVAL '%s days'
-                    )
-                """, (RAW_RETENTION_DAYS,))
-                
-                cur.execute("""
-                    DELETE FROM kpi_snapshots 
-                    WHERE timestamp < NOW() - INTERVAL '%s days'
-                """, (RAW_RETENTION_DAYS,))
-                
-                deleted = cur.rowcount
-                conn.commit()
-                if deleted > 0:
-                    logger.info(f"Cleaned {deleted} old records")
-    except Exception as e:
-        logger.error(f"Cleanup error: {e}")
+def calculate_station_metrics(trains):
+    """Calculate metrics by origin/destination station."""
+    stations = defaultdict(lambda: {"origins": [], "destinations": [], "delays": []})
+    
+    for train in trains:
+        origin = train.get("origin", "Unknown")
+        dest = train.get("destination", "Unknown")
+        delay = train.get("delay", 0) or 0
+        
+        if origin and origin != "Unknown":
+            stations[origin]["origins"].append(train)
+            stations[origin]["delays"].append(delay)
+        if dest and dest != "Unknown":
+            stations[dest]["destinations"].append(train)
+            stations[dest]["delays"].append(delay)
+    
+    result = {}
+    for station, data in stations.items():
+        delays = data["delays"]
+        total = len(data["origins"]) + len(data["destinations"])
+        if total > 0:
+            on_time = sum(1 for d in delays if d <= 0)
+            result[station] = {
+                "total_trains": total,
+                "origins": len(data["origins"]),
+                "destinations": len(data["destinations"]),
+                "avg_delay": round(sum(delays) / len(delays), 2) if delays else 0,
+                "max_delay": max(delays) if delays else 0,
+                "on_time_count": on_time,
+                "on_time_pct": round(on_time / len(delays) * 100, 2) if delays else 100
+            }
+    
+    return result
 
 
 def calculate_route_metrics(trains):
+    """Calculate per-route KPIs."""
     routes = defaultdict(lambda: {"trains": [], "delays": [], "speeds": []})
     
     for train in trains:
@@ -341,9 +461,11 @@ def calculate_route_metrics(trains):
 
 
 def calculate_kpi(trains):
+    """Calculate overall KPI metrics with time info."""
     if not trains:
         return None
     
+    now = datetime.utcnow()
     speeds = [t.get("speed", 0) or 0 for t in trains]
     delays = [t.get("delay", 0) or 0 for t in trains]
     
@@ -353,7 +475,7 @@ def calculate_kpi(trains):
     oee = min((avg_speed / 55) * 100, 100) if avg_speed > 0 else 0
     
     return {
-        "timestamp": datetime.utcnow().isoformat(),
+        "timestamp": now.isoformat(),
         "total_trains": len(trains),
         "moving": moving,
         "stopped": len(trains) - moving,
@@ -361,11 +483,15 @@ def calculate_kpi(trains):
         "avg_speed": round(avg_speed, 2),
         "max_speed": round(max(speeds), 2) if speeds else 0,
         "oee": round(oee, 2),
-        "on_time_pct": round(((len(trains) - delayed) / len(trains) * 100), 2)
+        "on_time_pct": round(((len(trains) - delayed) / len(trains) * 100), 2),
+        "hour_of_day": now.hour,
+        "day_of_week": now.weekday(),
+        "is_weekend": now.weekday() >= 5
     }
 
 
 def fetch_trains():
+    """Fetch train data from Amtraker API."""
     try:
         response = requests.get(f"{AMTRAKER_API}/trains", timeout=15)
         if response.status_code != 200:
@@ -404,13 +530,217 @@ def fetch_trains():
         return []
 
 
+def save_snapshot(kpi, route_metrics, station_metrics):
+    """Save all snapshot data."""
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                # KPI snapshot
+                cur.execute("""
+                    INSERT INTO kpi_snapshots 
+                    (total_trains, moving, stopped, delayed, avg_speed, max_speed, 
+                     oee, on_time_pct, hour_of_day, day_of_week, is_weekend)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    RETURNING id
+                """, (
+                    kpi["total_trains"], kpi["moving"], kpi["stopped"], kpi["delayed"],
+                    kpi["avg_speed"], kpi["max_speed"], kpi["oee"], kpi["on_time_pct"],
+                    kpi["hour_of_day"], kpi["day_of_week"], kpi["is_weekend"]
+                ))
+                snapshot_id = cur.fetchone()[0]
+                
+                # Route snapshots
+                for route_name, metrics in route_metrics.items():
+                    cur.execute("""
+                        INSERT INTO route_snapshots
+                        (snapshot_id, route_name, train_count, avg_speed, max_speed, 
+                         delayed_count, on_time_pct, avg_delay, headway_minutes)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    """, (
+                        snapshot_id, route_name, metrics["count"], metrics["avg_speed"],
+                        metrics["max_speed"], metrics["delayed"], metrics["on_time_pct"],
+                        metrics["avg_delay"], metrics.get("headway")
+                    ))
+                
+                # Station snapshots (top 50 by train count to save space)
+                sorted_stations = sorted(station_metrics.items(), 
+                                        key=lambda x: x[1]["total_trains"], reverse=True)[:50]
+                for station_name, metrics in sorted_stations:
+                    cur.execute("""
+                        INSERT INTO station_snapshots
+                        (snapshot_id, station_name, station_type, train_count, 
+                         avg_delay, max_delay, on_time_count)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    """, (
+                        snapshot_id, station_name, "hub",
+                        metrics["total_trains"], metrics["avg_delay"],
+                        metrics["max_delay"], metrics["on_time_count"]
+                    ))
+                
+                conn.commit()
+                collection_stats["successful_saves"] += 1
+                return snapshot_id
+    except Exception as e:
+        logger.error(f"Save error: {e}")
+        collection_stats["failed_saves"] += 1
+        collection_stats["last_error"] = str(e)
+        return None
+
+
+def run_hourly_aggregation():
+    """Aggregate data into hourly/daily summaries."""
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                # Hourly KPI aggregation
+                cur.execute("""
+                    INSERT INTO kpi_hourly (
+                        hour_start, hour_of_day, day_of_week, is_weekend,
+                        sample_count, avg_trains, min_trains, max_trains,
+                        avg_moving, avg_stopped, avg_delayed, avg_speed, min_speed, max_speed,
+                        avg_oee, min_oee, max_oee, avg_on_time_pct
+                    )
+                    SELECT 
+                        date_trunc('hour', timestamp),
+                        EXTRACT(hour FROM date_trunc('hour', timestamp))::int,
+                        EXTRACT(dow FROM date_trunc('hour', timestamp))::int,
+                        EXTRACT(dow FROM date_trunc('hour', timestamp)) IN (0, 6),
+                        COUNT(*), AVG(total_trains), MIN(total_trains), MAX(total_trains),
+                        AVG(moving), AVG(stopped), AVG(delayed),
+                        AVG(avg_speed), MIN(avg_speed), MAX(avg_speed),
+                        AVG(oee), MIN(oee), MAX(oee), AVG(on_time_pct)
+                    FROM kpi_snapshots
+                    WHERE timestamp >= NOW() - INTERVAL '2 hours'
+                      AND timestamp < date_trunc('hour', NOW())
+                    GROUP BY date_trunc('hour', timestamp)
+                    ON CONFLICT (hour_start) DO UPDATE SET
+                        sample_count = EXCLUDED.sample_count,
+                        avg_oee = EXCLUDED.avg_oee,
+                        avg_on_time_pct = EXCLUDED.avg_on_time_pct
+                """)
+                
+                # Daily KPI aggregation
+                cur.execute("""
+                    INSERT INTO kpi_daily (
+                        date, day_of_week, is_weekend,
+                        sample_count, avg_trains, min_trains, max_trains,
+                        avg_speed, avg_oee, min_oee, max_oee, avg_on_time_pct,
+                        peak_hour, peak_trains
+                    )
+                    SELECT 
+                        date_trunc('day', hour_start)::date,
+                        EXTRACT(dow FROM date_trunc('day', hour_start))::int,
+                        EXTRACT(dow FROM date_trunc('day', hour_start)) IN (0, 6),
+                        SUM(sample_count), AVG(avg_trains), MIN(min_trains), MAX(max_trains),
+                        AVG(avg_speed), AVG(avg_oee), MIN(min_oee), MAX(max_oee),
+                        AVG(avg_on_time_pct), 0, MAX(max_trains)
+                    FROM kpi_hourly
+                    WHERE hour_start >= NOW() - INTERVAL '2 days'
+                      AND hour_start < date_trunc('day', NOW())
+                    GROUP BY date_trunc('day', hour_start)::date
+                    ON CONFLICT (date) DO UPDATE SET
+                        sample_count = EXCLUDED.sample_count,
+                        avg_oee = EXCLUDED.avg_oee
+                """)
+                
+                # Route daily aggregation
+                cur.execute("""
+                    INSERT INTO route_daily (
+                        date, route_name, sample_count, avg_trains, avg_speed,
+                        avg_delay, on_time_pct, avg_headway, reliability_score
+                    )
+                    SELECT 
+                        date_trunc('day', k.timestamp)::date,
+                        r.route_name, COUNT(*), AVG(r.train_count), AVG(r.avg_speed),
+                        AVG(r.avg_delay), AVG(r.on_time_pct), AVG(r.headway_minutes),
+                        (AVG(r.on_time_pct) * 0.4 + 
+                         (100 - LEAST(AVG(ABS(r.avg_delay)), 30) * 3.33) * 0.3 + 
+                         LEAST(AVG(r.avg_speed) / 60 * 100, 100) * 0.3)
+                    FROM route_snapshots r
+                    JOIN kpi_snapshots k ON r.snapshot_id = k.id
+                    WHERE k.timestamp >= NOW() - INTERVAL '2 days'
+                      AND k.timestamp < date_trunc('day', NOW())
+                    GROUP BY date_trunc('day', k.timestamp)::date, r.route_name
+                    ON CONFLICT (date, route_name) DO UPDATE SET
+                        sample_count = EXCLUDED.sample_count,
+                        reliability_score = EXCLUDED.reliability_score
+                """)
+                
+                # Station daily aggregation
+                cur.execute("""
+                    INSERT INTO station_daily (
+                        date, station_name, total_trains, avg_delay, max_delay, 
+                        on_time_pct, delay_score
+                    )
+                    SELECT 
+                        date_trunc('day', k.timestamp)::date,
+                        s.station_name, SUM(s.train_count), AVG(s.avg_delay), MAX(s.max_delay),
+                        AVG(s.on_time_count::float / NULLIF(s.train_count, 0) * 100),
+                        (100 - LEAST(AVG(s.avg_delay), 60) * 1.67)
+                    FROM station_snapshots s
+                    JOIN kpi_snapshots k ON s.snapshot_id = k.id
+                    WHERE k.timestamp >= NOW() - INTERVAL '2 days'
+                      AND k.timestamp < date_trunc('day', NOW())
+                    GROUP BY date_trunc('day', k.timestamp)::date, s.station_name
+                    ON CONFLICT (date, station_name) DO UPDATE SET
+                        total_trains = EXCLUDED.total_trains,
+                        delay_score = EXCLUDED.delay_score
+                """)
+                
+                # Update time patterns
+                cur.execute("""
+                    INSERT INTO time_patterns (hour_of_day, day_type, sample_days, 
+                                               avg_trains, avg_oee, avg_on_time_pct, avg_speed)
+                    SELECT 
+                        hour_of_day,
+                        CASE WHEN is_weekend THEN 'weekend' ELSE 'weekday' END,
+                        COUNT(DISTINCT date_trunc('day', hour_start)),
+                        AVG(avg_trains), AVG(avg_oee), AVG(avg_on_time_pct), AVG(avg_speed)
+                    FROM kpi_hourly
+                    WHERE hour_start > NOW() - INTERVAL '30 days'
+                    GROUP BY hour_of_day, is_weekend
+                    ON CONFLICT (hour_of_day, day_type) DO UPDATE SET
+                        sample_days = EXCLUDED.sample_days,
+                        avg_trains = EXCLUDED.avg_trains,
+                        avg_oee = EXCLUDED.avg_oee,
+                        avg_on_time_pct = EXCLUDED.avg_on_time_pct,
+                        avg_speed = EXCLUDED.avg_speed,
+                        updated_at = NOW()
+                """)
+                
+                conn.commit()
+                collection_stats["last_aggregation"] = datetime.utcnow().isoformat()
+                logger.info("Aggregation completed")
+    except Exception as e:
+        logger.error(f"Aggregation error: {e}")
+
+
+def cleanup_old_data():
+    """Remove raw data older than retention period."""
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM station_snapshots WHERE snapshot_id IN (SELECT id FROM kpi_snapshots WHERE timestamp < NOW() - INTERVAL '%s days')", (RAW_RETENTION_DAYS,))
+                cur.execute("DELETE FROM route_snapshots WHERE snapshot_id IN (SELECT id FROM kpi_snapshots WHERE timestamp < NOW() - INTERVAL '%s days')", (RAW_RETENTION_DAYS,))
+                cur.execute("DELETE FROM kpi_snapshots WHERE timestamp < NOW() - INTERVAL '%s days'", (RAW_RETENTION_DAYS,))
+                cur.execute("DELETE FROM weather_snapshots WHERE timestamp < NOW() - INTERVAL '30 days'")
+                deleted = cur.rowcount
+                conn.commit()
+                if deleted > 0:
+                    logger.info(f"Cleaned {deleted} old records")
+    except Exception as e:
+        logger.error(f"Cleanup error: {e}")
+
+
 def collect_data():
+    """Main data collection loop."""
     time.sleep(5)
     init_database()
     collection_stats["started_at"] = datetime.utcnow().isoformat()
     
     last_aggregation = time.time()
     last_cleanup = time.time()
+    last_weather = 0
     
     while True:
         try:
@@ -420,21 +750,34 @@ def collect_data():
             if trains:
                 kpi = calculate_kpi(trains)
                 route_metrics = calculate_route_metrics(trains)
+                station_metrics = calculate_station_metrics(trains)
                 
                 latest_cache["trains"] = trains
                 latest_cache["timestamp"] = datetime.utcnow().isoformat()
                 latest_cache["kpi"] = kpi
                 latest_cache["routes"] = route_metrics
+                latest_cache["stations"] = station_metrics
                 
                 if kpi and DATABASE_URL:
-                    snapshot_id = save_snapshot(kpi, route_metrics)
+                    snapshot_id = save_snapshot(kpi, route_metrics, station_metrics)
                     if snapshot_id:
                         logger.info(f"#{snapshot_id}: {len(trains)} trains, OEE={kpi['oee']:.1f}%")
             
+            # Weather fetch (every 15 min)
+            if time.time() - last_weather > WEATHER_INTERVAL:
+                weather = fetch_weather()
+                if weather:
+                    latest_cache["weather"] = weather
+                    save_weather(weather)
+                    collection_stats["last_weather_fetch"] = datetime.utcnow().isoformat()
+                last_weather = time.time()
+            
+            # Hourly aggregation
             if time.time() - last_aggregation > AGGREGATION_INTERVAL:
                 run_hourly_aggregation()
                 last_aggregation = time.time()
             
+            # Daily cleanup
             if time.time() - last_cleanup > 86400:
                 cleanup_old_data()
                 last_cleanup = time.time()
@@ -450,12 +793,18 @@ collector_thread = threading.Thread(target=collect_data, daemon=True)
 collector_thread.start()
 
 
+# =============================================================================
+# API ENDPOINTS
+# =============================================================================
+
 @app.route("/")
 def home():
     return jsonify({
         "status": "running",
-        "service": "Amtrak Collector v4.0",
-        "database": "connected" if DATABASE_URL else "not configured"
+        "service": "Amtrak Collector v5.0",
+        "features": ["time_analysis", "weather", "incidents", "stations", "routes"],
+        "database": "connected" if DATABASE_URL else "not configured",
+        "weather_api": "configured" if OPENWEATHER_API_KEY else "not configured"
     })
 
 
@@ -497,6 +846,339 @@ def get_routes():
     return jsonify(latest_cache.get("routes", {}))
 
 
+@app.route("/api/stations")
+def get_stations():
+    return jsonify(latest_cache.get("stations", {}))
+
+
+@app.route("/api/weather/latest")
+def get_weather():
+    return jsonify(latest_cache.get("weather", {}))
+
+
+# Time-of-day analysis
+@app.route("/api/analysis/time-of-day")
+def get_time_patterns():
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute("""
+                    SELECT hour_of_day, day_type, sample_days,
+                           ROUND(avg_trains::numeric, 1) as avg_trains,
+                           ROUND(avg_oee::numeric, 1) as avg_oee,
+                           ROUND(avg_on_time_pct::numeric, 1) as avg_on_time_pct,
+                           ROUND(avg_speed::numeric, 1) as avg_speed
+                    FROM time_patterns
+                    ORDER BY day_type, hour_of_day
+                """)
+                rows = cur.fetchall()
+                
+                # Organize by day type
+                weekday = [r for r in rows if r["day_type"] == "weekday"]
+                weekend = [r for r in rows if r["day_type"] == "weekend"]
+                
+                return jsonify({
+                    "weekday": weekday,
+                    "weekend": weekend,
+                    "peak_hours": {
+                        "weekday_morning": "6-9 AM",
+                        "weekday_evening": "4-7 PM",
+                        "weekend": "10 AM - 6 PM"
+                    }
+                })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/analysis/hourly-heatmap")
+def get_hourly_heatmap():
+    """Get data for hour-by-day heatmap."""
+    days = request.args.get("days", 14, type=int)
+    metric = request.args.get("metric", "avg_oee")
+    
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(f"""
+                    SELECT 
+                        date_trunc('day', hour_start)::date as date,
+                        hour_of_day,
+                        ROUND({metric}::numeric, 1) as value
+                    FROM kpi_hourly
+                    WHERE hour_start > NOW() - INTERVAL '%s days'
+                    ORDER BY date, hour_of_day
+                """, (days,))
+                rows = cur.fetchall()
+                
+                # Convert to heatmap format
+                for r in rows:
+                    r["date"] = r["date"].isoformat()
+                
+                return jsonify({"data": rows, "metric": metric})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/analysis/weekday-comparison")
+def get_weekday_comparison():
+    """Compare metrics by day of week."""
+    days = request.args.get("days", 30, type=int)
+    
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute("""
+                    SELECT 
+                        day_of_week,
+                        CASE day_of_week 
+                            WHEN 0 THEN 'Sunday' WHEN 1 THEN 'Monday'
+                            WHEN 2 THEN 'Tuesday' WHEN 3 THEN 'Wednesday'
+                            WHEN 4 THEN 'Thursday' WHEN 5 THEN 'Friday'
+                            WHEN 6 THEN 'Saturday'
+                        END as day_name,
+                        COUNT(*) as sample_days,
+                        ROUND(AVG(avg_trains)::numeric, 1) as avg_trains,
+                        ROUND(AVG(avg_oee)::numeric, 1) as avg_oee,
+                        ROUND(AVG(avg_on_time_pct)::numeric, 1) as avg_on_time_pct
+                    FROM kpi_daily
+                    WHERE date > NOW() - INTERVAL '%s days'
+                    GROUP BY day_of_week
+                    ORDER BY day_of_week
+                """, (days,))
+                return jsonify({"days": cur.fetchall()})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# Weather correlation
+@app.route("/api/weather/correlation")
+def get_weather_correlation():
+    """Analyze weather impact on performance."""
+    days = request.args.get("days", 30, type=int)
+    
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute("""
+                    SELECT 
+                        w.conditions,
+                        COUNT(*) as samples,
+                        ROUND(AVG(k.avg_oee)::numeric, 1) as avg_oee,
+                        ROUND(AVG(k.on_time_pct)::numeric, 1) as avg_on_time_pct,
+                        ROUND(AVG(k.avg_speed)::numeric, 1) as avg_speed,
+                        ROUND(AVG(k.delayed)::numeric, 0) as avg_delayed
+                    FROM kpi_hourly k
+                    JOIN weather_snapshots w ON date_trunc('hour', w.timestamp) = k.hour_start
+                    WHERE k.hour_start > NOW() - INTERVAL '%s days'
+                    GROUP BY w.conditions
+                    HAVING COUNT(*) >= 5
+                    ORDER BY avg_oee DESC
+                """, (days,))
+                return jsonify({"by_conditions": cur.fetchall()})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/weather/history")
+def get_weather_history():
+    """Get weather history."""
+    hours = request.args.get("hours", 24, type=int)
+    city = request.args.get("city", None)
+    
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                if city:
+                    cur.execute("""
+                        SELECT * FROM weather_snapshots 
+                        WHERE timestamp > NOW() - INTERVAL '%s hours' AND city = %s
+                        ORDER BY timestamp DESC
+                    """, (hours, city))
+                else:
+                    cur.execute("""
+                        SELECT * FROM weather_snapshots 
+                        WHERE timestamp > NOW() - INTERVAL '%s hours'
+                        ORDER BY timestamp DESC
+                    """, (hours,))
+                
+                rows = cur.fetchall()
+                for r in rows:
+                    r["timestamp"] = r["timestamp"].isoformat()
+                return jsonify({"weather": rows})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# Incidents
+@app.route("/api/incidents", methods=["GET"])
+def get_incidents():
+    """Get incidents/annotations."""
+    active_only = request.args.get("active", "false").lower() == "true"
+    days = request.args.get("days", 30, type=int)
+    
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                if active_only:
+                    cur.execute("SELECT * FROM incidents WHERE is_active = true ORDER BY timestamp DESC")
+                else:
+                    cur.execute("""
+                        SELECT * FROM incidents 
+                        WHERE timestamp > NOW() - INTERVAL '%s days'
+                        ORDER BY timestamp DESC
+                    """, (days,))
+                
+                rows = cur.fetchall()
+                for r in rows:
+                    r["timestamp"] = r["timestamp"].isoformat()
+                    if r.get("end_timestamp"):
+                        r["end_timestamp"] = r["end_timestamp"].isoformat()
+                return jsonify({"incidents": rows})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/incidents", methods=["POST"])
+def create_incident():
+    """Create a new incident annotation."""
+    data = request.json
+    if not data or not data.get("title"):
+        return jsonify({"error": "Title required"}), 400
+    
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO incidents (title, description, severity, affected_routes, 
+                                          affected_stations, source)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    RETURNING id
+                """, (
+                    data["title"],
+                    data.get("description"),
+                    data.get("severity", "info"),
+                    data.get("affected_routes"),
+                    data.get("affected_stations"),
+                    data.get("source", "manual")
+                ))
+                incident_id = cur.fetchone()[0]
+                conn.commit()
+                return jsonify({"id": incident_id, "status": "created"})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/incidents/<int:incident_id>", methods=["PUT"])
+def update_incident(incident_id):
+    """Update an incident (e.g., mark resolved)."""
+    data = request.json
+    
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                if data.get("resolve"):
+                    cur.execute("""
+                        UPDATE incidents SET is_active = false, end_timestamp = NOW()
+                        WHERE id = %s
+                    """, (incident_id,))
+                else:
+                    updates = []
+                    values = []
+                    for field in ["title", "description", "severity"]:
+                        if field in data:
+                            updates.append(f"{field} = %s")
+                            values.append(data[field])
+                    if updates:
+                        values.append(incident_id)
+                        cur.execute(f"UPDATE incidents SET {', '.join(updates)} WHERE id = %s", values)
+                
+                conn.commit()
+                return jsonify({"status": "updated"})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# Station metrics
+@app.route("/api/stations/rankings")
+def get_station_rankings():
+    """Get station delay rankings."""
+    days = request.args.get("days", 7, type=int)
+    limit = request.args.get("limit", 20, type=int)
+    
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                # Worst stations (most delays)
+                cur.execute("""
+                    SELECT 
+                        station_name,
+                        SUM(total_trains) as total_trains,
+                        ROUND(AVG(avg_delay)::numeric, 1) as avg_delay,
+                        MAX(max_delay) as max_delay,
+                        ROUND(AVG(on_time_pct)::numeric, 1) as on_time_pct,
+                        ROUND(AVG(delay_score)::numeric, 1) as delay_score
+                    FROM station_daily
+                    WHERE date > NOW() - INTERVAL '%s days'
+                    GROUP BY station_name
+                    HAVING SUM(total_trains) >= 10
+                    ORDER BY avg_delay DESC
+                    LIMIT %s
+                """, (days, limit))
+                worst = cur.fetchall()
+                
+                # Best stations
+                cur.execute("""
+                    SELECT 
+                        station_name,
+                        SUM(total_trains) as total_trains,
+                        ROUND(AVG(avg_delay)::numeric, 1) as avg_delay,
+                        ROUND(AVG(on_time_pct)::numeric, 1) as on_time_pct,
+                        ROUND(AVG(delay_score)::numeric, 1) as delay_score
+                    FROM station_daily
+                    WHERE date > NOW() - INTERVAL '%s days'
+                    GROUP BY station_name
+                    HAVING SUM(total_trains) >= 10
+                    ORDER BY on_time_pct DESC
+                    LIMIT %s
+                """, (days, limit))
+                best = cur.fetchall()
+                
+                return jsonify({"worst_delays": worst, "best_on_time": best})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/stations/daily")
+def get_stations_daily():
+    """Get daily station metrics."""
+    days = request.args.get("days", 7, type=int)
+    station = request.args.get("station", None)
+    
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                if station:
+                    cur.execute("""
+                        SELECT * FROM station_daily 
+                        WHERE date > NOW() - INTERVAL '%s days' AND station_name = %s
+                        ORDER BY date
+                    """, (days, station))
+                else:
+                    cur.execute("""
+                        SELECT * FROM station_daily 
+                        WHERE date > NOW() - INTERVAL '%s days'
+                        ORDER BY date, station_name
+                    """, (days,))
+                
+                rows = cur.fetchall()
+                for r in rows:
+                    r["date"] = r["date"].isoformat()
+                return jsonify({"stations": rows})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# Existing endpoints
 @app.route("/api/kpi/snapshots")
 def get_snapshots():
     limit = min(request.args.get("limit", 100, type=int), 1000)
@@ -507,21 +1189,14 @@ def get_snapshots():
             with conn.cursor(row_factory=dict_row) as cur:
                 if hours:
                     hours = min(hours, RAW_RETENTION_DAYS * 24)
-                    cur.execute(
-                        "SELECT * FROM kpi_snapshots WHERE timestamp > NOW() - INTERVAL '%s hours' ORDER BY timestamp ASC",
-                        (hours,)
-                    )
+                    cur.execute("SELECT * FROM kpi_snapshots WHERE timestamp > NOW() - INTERVAL '%s hours' ORDER BY timestamp ASC", (hours,))
                 else:
-                    cur.execute(
-                        "SELECT * FROM kpi_snapshots ORDER BY timestamp DESC LIMIT %s",
-                        (limit,)
-                    )
+                    cur.execute("SELECT * FROM kpi_snapshots ORDER BY timestamp DESC LIMIT %s", (limit,))
                 
                 rows = cur.fetchall()
                 for r in rows:
                     if r.get("timestamp"):
                         r["timestamp"] = r["timestamp"].isoformat()
-                
                 return jsonify({"snapshots": rows, "total": len(rows)})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -534,10 +1209,7 @@ def get_hourly():
     try:
         with get_db_connection() as conn:
             with conn.cursor(row_factory=dict_row) as cur:
-                cur.execute(
-                    "SELECT * FROM kpi_hourly WHERE hour_start > NOW() - INTERVAL '%s days' ORDER BY hour_start ASC",
-                    (days,)
-                )
+                cur.execute("SELECT * FROM kpi_hourly WHERE hour_start > NOW() - INTERVAL '%s days' ORDER BY hour_start ASC", (days,))
                 rows = cur.fetchall()
                 for r in rows:
                     if r.get("hour_start"):
@@ -554,10 +1226,7 @@ def get_daily():
     try:
         with get_db_connection() as conn:
             with conn.cursor(row_factory=dict_row) as cur:
-                cur.execute(
-                    "SELECT * FROM kpi_daily WHERE date > NOW() - INTERVAL '%s days' ORDER BY date ASC",
-                    (days,)
-                )
+                cur.execute("SELECT * FROM kpi_daily WHERE date > NOW() - INTERVAL '%s days' ORDER BY date ASC", (days,))
                 rows = cur.fetchall()
                 for r in rows:
                     if r.get("date"):
@@ -576,15 +1245,9 @@ def get_routes_daily():
         with get_db_connection() as conn:
             with conn.cursor(row_factory=dict_row) as cur:
                 if route:
-                    cur.execute(
-                        "SELECT * FROM route_daily WHERE date > NOW() - INTERVAL '%s days' AND route_name = %s ORDER BY date ASC",
-                        (days, route)
-                    )
+                    cur.execute("SELECT * FROM route_daily WHERE date > NOW() - INTERVAL '%s days' AND route_name = %s ORDER BY date ASC", (days, route))
                 else:
-                    cur.execute(
-                        "SELECT * FROM route_daily WHERE date > NOW() - INTERVAL '%s days' ORDER BY date ASC, route_name",
-                        (days,)
-                    )
+                    cur.execute("SELECT * FROM route_daily WHERE date > NOW() - INTERVAL '%s days' ORDER BY date ASC, route_name", (days,))
                 
                 rows = cur.fetchall()
                 for r in rows:
@@ -630,6 +1293,10 @@ def get_stats():
                 daily = cur.fetchone()
                 cur.execute("SELECT COUNT(DISTINCT route_name) as count FROM route_daily")
                 routes = cur.fetchone()
+                cur.execute("SELECT COUNT(DISTINCT station_name) as count FROM station_daily")
+                stations = cur.fetchone()
+                cur.execute("SELECT COUNT(*) as count FROM incidents WHERE is_active = true")
+                incidents = cur.fetchone()
                 
                 return jsonify({
                     "raw_snapshots": raw["count"],
@@ -638,6 +1305,8 @@ def get_stats():
                     "hourly_records": hourly["count"],
                     "daily_records": daily["count"],
                     "routes_tracked": routes["count"],
+                    "stations_tracked": stations["count"],
+                    "active_incidents": incidents["count"],
                     "retention_days": RAW_RETENTION_DAYS,
                     "collection_stats": collection_stats
                 })
@@ -654,20 +1323,13 @@ def export_csv():
         with get_db_connection() as conn:
             with conn.cursor(row_factory=dict_row) as cur:
                 if data_type == "hourly":
-                    cur.execute(
-                        "SELECT * FROM kpi_hourly WHERE hour_start > NOW() - INTERVAL '%s days' ORDER BY hour_start",
-                        (days,)
-                    )
+                    cur.execute("SELECT * FROM kpi_hourly WHERE hour_start > NOW() - INTERVAL '%s days' ORDER BY hour_start", (days,))
                 elif data_type == "routes":
-                    cur.execute(
-                        "SELECT * FROM route_daily WHERE date > NOW() - INTERVAL '%s days' ORDER BY date, route_name",
-                        (days,)
-                    )
+                    cur.execute("SELECT * FROM route_daily WHERE date > NOW() - INTERVAL '%s days' ORDER BY date, route_name", (days,))
+                elif data_type == "stations":
+                    cur.execute("SELECT * FROM station_daily WHERE date > NOW() - INTERVAL '%s days' ORDER BY date, station_name", (days,))
                 else:
-                    cur.execute(
-                        "SELECT * FROM kpi_daily WHERE date > NOW() - INTERVAL '%s days' ORDER BY date",
-                        (days,)
-                    )
+                    cur.execute("SELECT * FROM kpi_daily WHERE date > NOW() - INTERVAL '%s days' ORDER BY date", (days,))
                 
                 rows = cur.fetchall()
                 if not rows:
