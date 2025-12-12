@@ -1,1 +1,1 @@
-web: gunicorn railway_collector:app
+web: gunicorn amtrak_collector:app
