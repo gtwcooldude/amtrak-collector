@@ -1,5 +1,5 @@
 """
-Amtrak Real-Time Data Collector v5.0
+Amtrak Real-Time Data Collector v6.0
 =====================================
 Features:
 - Time-of-day analysis (peak/off-peak, weekday/weekend)
@@ -8,6 +8,8 @@ Features:
 - Station-level metrics
 - Hourly/daily rollups
 - Route performance tracking
+- NEW: Delay Cascade Predictor
+- NEW: Track Segment Bottleneck Analysis
 """
 
 import os
@@ -39,6 +41,68 @@ WEATHER_INTERVAL = 900  # 15 minutes
 DATABASE_URL = os.environ.get("DATABASE_URL")
 OPENWEATHER_API_KEY = os.environ.get("OPENWEATHER_API_KEY")
 
+# Corridor definitions - routes that share track
+CORRIDORS = {
+    "NEC": {
+        "name": "Northeast Corridor",
+        "routes": ["Acela", "Northeast Regional", "Vermonter", "Carolinian", "Palmetto", 
+                   "Silver Star", "Silver Meteor", "Pennsylvanian", "Keystone"],
+        "segments": [
+            {"name": "Boston-Providence", "lat_range": (41.5, 42.4), "lon_range": (-71.5, -70.8)},
+            {"name": "Providence-New Haven", "lat_range": (41.2, 41.8), "lon_range": (-73.0, -71.4)},
+            {"name": "New Haven-NYC", "lat_range": (40.7, 41.3), "lon_range": (-74.0, -72.9)},
+            {"name": "NYC-Trenton", "lat_range": (40.2, 40.8), "lon_range": (-74.8, -73.9)},
+            {"name": "Trenton-Philadelphia", "lat_range": (39.9, 40.3), "lon_range": (-75.2, -74.7)},
+            {"name": "Philadelphia-Wilmington", "lat_range": (39.7, 40.0), "lon_range": (-75.6, -75.1)},
+            {"name": "Wilmington-Baltimore", "lat_range": (39.2, 39.8), "lon_range": (-76.7, -75.5)},
+            {"name": "Baltimore-DC", "lat_range": (38.8, 39.3), "lon_range": (-77.1, -76.5)},
+        ]
+    },
+    "Empire": {
+        "name": "Empire Corridor", 
+        "routes": ["Empire Service", "Lake Shore Limited", "Maple Leaf", "Adirondack", "Ethan Allen Express"],
+        "segments": [
+            {"name": "NYC-Yonkers", "lat_range": (40.7, 41.0), "lon_range": (-74.0, -73.8)},
+            {"name": "Yonkers-Poughkeepsie", "lat_range": (41.0, 41.8), "lon_range": (-74.1, -73.7)},
+            {"name": "Poughkeepsie-Albany", "lat_range": (41.8, 42.7), "lon_range": (-74.0, -73.6)},
+            {"name": "Albany-Syracuse", "lat_range": (42.6, 43.1), "lon_range": (-76.2, -73.7)},
+            {"name": "Syracuse-Rochester", "lat_range": (43.0, 43.2), "lon_range": (-77.7, -76.1)},
+            {"name": "Rochester-Buffalo", "lat_range": (42.8, 43.2), "lon_range": (-78.9, -77.5)},
+        ]
+    },
+    "California": {
+        "name": "California Corridor",
+        "routes": ["Pacific Surfliner", "Coast Starlight", "Capitol Corridor", "San Joaquins"],
+        "segments": [
+            {"name": "San Diego-LA", "lat_range": (32.7, 34.1), "lon_range": (-118.5, -117.1)},
+            {"name": "LA-Santa Barbara", "lat_range": (34.0, 34.5), "lon_range": (-120.0, -118.2)},
+            {"name": "Santa Barbara-SLO", "lat_range": (34.4, 35.3), "lon_range": (-120.9, -119.7)},
+            {"name": "Bay Area", "lat_range": (37.3, 38.0), "lon_range": (-122.5, -121.8)},
+            {"name": "Sacramento-Oakland", "lat_range": (37.7, 38.6), "lon_range": (-122.4, -121.4)},
+        ]
+    },
+    "Midwest": {
+        "name": "Chicago Hub",
+        "routes": ["Lincoln Service", "Illinois Zephyr", "Carl Sandburg", "Hiawatha", 
+                   "Pere Marquette", "Wolverine", "Blue Water", "City of New Orleans",
+                   "Texas Eagle", "Southwest Chief", "Empire Builder", "California Zephyr"],
+        "segments": [
+            {"name": "Chicago-Milwaukee", "lat_range": (41.8, 43.1), "lon_range": (-88.0, -87.5)},
+            {"name": "Chicago-Springfield", "lat_range": (39.7, 41.9), "lon_range": (-89.8, -87.6)},
+            {"name": "Chicago-Detroit", "lat_range": (41.8, 42.4), "lon_range": (-87.7, -83.0)},
+        ]
+    },
+    "Southeast": {
+        "name": "Southeast Corridor",
+        "routes": ["Carolinian", "Piedmont", "Silver Star", "Silver Meteor", "Palmetto", "Auto Train"],
+        "segments": [
+            {"name": "DC-Richmond", "lat_range": (37.5, 38.9), "lon_range": (-77.5, -76.9)},
+            {"name": "Richmond-Raleigh", "lat_range": (35.7, 37.6), "lon_range": (-79.0, -77.3)},
+            {"name": "Raleigh-Charlotte", "lat_range": (35.2, 35.8), "lon_range": (-80.9, -78.6)},
+        ]
+    }
+}
+
 # Key cities for weather (covers major Amtrak corridors)
 WEATHER_CITIES = [
     {"name": "New York", "lat": 40.7128, "lon": -74.0060},
@@ -55,8 +119,156 @@ latest_cache = {
     "kpi": None,
     "routes": {},
     "weather": {},
-    "stations": {}
+    "stations": {},
+    "cascade": {},
+    "segments": []
 }
+
+
+# =============================================================================
+# CASCADE & SEGMENT ANALYSIS FUNCTIONS
+# =============================================================================
+
+def get_train_corridor(route_name):
+    """Determine which corridor a train belongs to."""
+    for corridor_id, corridor in CORRIDORS.items():
+        if any(r.lower() in route_name.lower() for r in corridor["routes"]):
+            return corridor_id, corridor
+    return None, None
+
+
+def get_train_segment(lat, lon, corridor_id):
+    """Determine which track segment a train is in."""
+    if corridor_id not in CORRIDORS:
+        return None
+    
+    for segment in CORRIDORS[corridor_id]["segments"]:
+        lat_min, lat_max = segment["lat_range"]
+        lon_min, lon_max = segment["lon_range"]
+        if lat_min <= lat <= lat_max and lon_min <= lon <= lon_max:
+            return segment["name"]
+    return None
+
+
+def analyze_cascade_risk(trains):
+    """Analyze delay cascade risks across corridors."""
+    corridor_status = {}
+    
+    for corridor_id, corridor in CORRIDORS.items():
+        corridor_trains = []
+        for train in trains:
+            train_corridor, _ = get_train_corridor(train.get("routeName", ""))
+            if train_corridor == corridor_id:
+                corridor_trains.append(train)
+        
+        if not corridor_trains:
+            continue
+        
+        delayed_trains = [t for t in corridor_trains if (t.get("delay") or 0) > 10]
+        severely_delayed = [t for t in corridor_trains if (t.get("delay") or 0) > 30]
+        
+        risk_score = 0
+        risk_factors = []
+        
+        if len(severely_delayed) > 0:
+            risk_score += 40
+            risk_factors.append(f"{len(severely_delayed)} trains >30min late")
+        
+        if len(delayed_trains) >= 3:
+            risk_score += 30
+            risk_factors.append(f"{len(delayed_trains)} trains delayed")
+        elif len(delayed_trains) >= 2:
+            risk_score += 15
+        
+        segment_delays = {}
+        for train in delayed_trains:
+            seg = get_train_segment(train.get("latitude", 0), train.get("longitude", 0), corridor_id)
+            if seg:
+                segment_delays[seg] = segment_delays.get(seg, 0) + 1
+        
+        clustered_segments = [s for s, c in segment_delays.items() if c >= 2]
+        if clustered_segments:
+            risk_score += 20
+            risk_factors.append(f"Clustering in: {', '.join(clustered_segments)}")
+        
+        affected = []
+        for train in corridor_trains:
+            if train not in delayed_trains and (train.get("delay") or 0) <= 5:
+                seg = get_train_segment(train.get("latitude", 0), train.get("longitude", 0), corridor_id)
+                if seg in clustered_segments:
+                    affected.append({
+                        "trainNum": train.get("trainNum"),
+                        "route": train.get("routeName"),
+                        "risk": "high",
+                        "reason": f"Approaching congestion in {seg}"
+                    })
+        
+        corridor_status[corridor_id] = {
+            "name": corridor["name"],
+            "total_trains": len(corridor_trains),
+            "delayed": len(delayed_trains),
+            "severely_delayed": len(severely_delayed),
+            "risk_score": min(risk_score, 100),
+            "risk_level": "critical" if risk_score >= 70 else "high" if risk_score >= 40 else "moderate" if risk_score >= 20 else "low",
+            "risk_factors": risk_factors,
+            "affected_trains": affected[:5],
+            "segment_delays": segment_delays
+        }
+    
+    return corridor_status
+
+
+def analyze_segments(trains):
+    """Analyze speed and performance by track segment."""
+    segment_data = {}
+    
+    for train in trains:
+        lat = train.get("latitude", 0)
+        lon = train.get("longitude", 0)
+        speed = train.get("speed", 0) or 0
+        delay = train.get("delay", 0) or 0
+        
+        corridor_id, _ = get_train_corridor(train.get("routeName", ""))
+        if not corridor_id:
+            continue
+            
+        segment = get_train_segment(lat, lon, corridor_id)
+        if not segment:
+            continue
+        
+        key = f"{corridor_id}:{segment}"
+        if key not in segment_data:
+            segment_data[key] = {
+                "corridor": corridor_id,
+                "segment": segment,
+                "speeds": [],
+                "delays": [],
+                "train_count": 0
+            }
+        
+        segment_data[key]["speeds"].append(speed)
+        segment_data[key]["delays"].append(delay)
+        segment_data[key]["train_count"] += 1
+    
+    results = []
+    for key, data in segment_data.items():
+        if data["speeds"]:
+            avg_speed = sum(data["speeds"]) / len(data["speeds"])
+            avg_delay = sum(data["delays"]) / len(data["delays"])
+            speed_score = min(avg_speed / 60 * 100, 100)
+            
+            results.append({
+                "corridor": data["corridor"],
+                "corridor_name": CORRIDORS[data["corridor"]]["name"],
+                "segment": data["segment"],
+                "train_count": data["train_count"],
+                "avg_speed": round(avg_speed, 1),
+                "avg_delay": round(avg_delay, 1),
+                "speed_score": round(speed_score, 1),
+                "is_bottleneck": speed_score < 50 and data["train_count"] >= 2
+            })
+    
+    return sorted(results, key=lambda x: x["speed_score"])
 
 collection_stats = {
     "started_at": None,
@@ -182,6 +394,53 @@ def init_database():
                         affected_stations TEXT[],
                         source VARCHAR(100),
                         is_active BOOLEAN DEFAULT TRUE
+                    )
+                """)
+                
+                # Segment snapshots for bottleneck analysis
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS segment_snapshots (
+                        id SERIAL PRIMARY KEY,
+                        snapshot_id INTEGER REFERENCES kpi_snapshots(id) ON DELETE CASCADE,
+                        corridor VARCHAR(50),
+                        segment VARCHAR(100),
+                        train_count INTEGER,
+                        avg_speed FLOAT,
+                        avg_delay FLOAT,
+                        speed_score FLOAT,
+                        is_bottleneck BOOLEAN
+                    )
+                """)
+                
+                # Cascade events log
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS cascade_events (
+                        id SERIAL PRIMARY KEY,
+                        timestamp TIMESTAMPTZ DEFAULT NOW(),
+                        corridor VARCHAR(50),
+                        corridor_name VARCHAR(100),
+                        risk_level VARCHAR(20),
+                        risk_score INTEGER,
+                        total_trains INTEGER,
+                        delayed_trains INTEGER,
+                        affected_trains INTEGER,
+                        risk_factors TEXT[]
+                    )
+                """)
+                
+                # Segment daily aggregation
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS segment_daily (
+                        id SERIAL PRIMARY KEY,
+                        date DATE,
+                        corridor VARCHAR(50),
+                        segment VARCHAR(100),
+                        sample_count INTEGER,
+                        avg_speed FLOAT,
+                        min_speed FLOAT,
+                        avg_delay FLOAT,
+                        bottleneck_pct FLOAT,
+                        UNIQUE(date, corridor, segment)
                     )
                 """)
                 
@@ -315,6 +574,10 @@ def init_database():
                 cur.execute("CREATE INDEX IF NOT EXISTS idx_daily_date ON kpi_daily(date DESC)")
                 cur.execute("CREATE INDEX IF NOT EXISTS idx_route_daily ON route_daily(date DESC, route_name)")
                 cur.execute("CREATE INDEX IF NOT EXISTS idx_station_daily ON station_daily(date DESC, station_name)")
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_segment_snap ON segment_snapshots(snapshot_id)")
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_cascade_time ON cascade_events(timestamp DESC)")
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_cascade_corridor ON cascade_events(corridor)")
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_segment_daily ON segment_daily(date DESC, corridor)")
                 
                 conn.commit()
                 logger.info("Database initialized successfully")
@@ -587,6 +850,50 @@ def save_snapshot(kpi, route_metrics, station_metrics):
         return None
 
 
+def save_segment_data(snapshot_id, segments):
+    """Save segment analysis data."""
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                for seg in segments:
+                    cur.execute("""
+                        INSERT INTO segment_snapshots
+                        (snapshot_id, corridor, segment, train_count, avg_speed, 
+                         avg_delay, speed_score, is_bottleneck)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    """, (
+                        snapshot_id, seg["corridor"], seg["segment"], seg["train_count"],
+                        seg["avg_speed"], seg["avg_delay"], seg["speed_score"], seg["is_bottleneck"]
+                    ))
+                conn.commit()
+    except Exception as e:
+        logger.error(f"Segment save error: {e}")
+
+
+def save_cascade_event(corridor_id, cascade_data):
+    """Save significant cascade events for history."""
+    if cascade_data["risk_score"] < 40:  # Only log moderate+ risk
+        return
+    
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO cascade_events
+                    (corridor, corridor_name, risk_level, risk_score, total_trains,
+                     delayed_trains, affected_trains, risk_factors)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                """, (
+                    corridor_id, cascade_data["name"], cascade_data["risk_level"],
+                    cascade_data["risk_score"], cascade_data["total_trains"],
+                    cascade_data["delayed"], len(cascade_data["affected_trains"]),
+                    cascade_data["risk_factors"]
+                ))
+                conn.commit()
+    except Exception as e:
+        logger.error(f"Cascade save error: {e}")
+
+
 def run_hourly_aggregation():
     """Aggregate data into hourly/daily summaries."""
     try:
@@ -741,6 +1048,7 @@ def collect_data():
     last_aggregation = time.time()
     last_cleanup = time.time()
     last_weather = 0
+    last_cascade_log = 0
     
     while True:
         try:
@@ -751,16 +1059,30 @@ def collect_data():
                 kpi = calculate_kpi(trains)
                 route_metrics = calculate_route_metrics(trains)
                 station_metrics = calculate_station_metrics(trains)
+                cascade_status = analyze_cascade_risk(trains)
+                segment_analysis = analyze_segments(trains)
                 
                 latest_cache["trains"] = trains
                 latest_cache["timestamp"] = datetime.utcnow().isoformat()
                 latest_cache["kpi"] = kpi
                 latest_cache["routes"] = route_metrics
                 latest_cache["stations"] = station_metrics
+                latest_cache["cascade"] = cascade_status
+                latest_cache["segments"] = segment_analysis
                 
                 if kpi and DATABASE_URL:
                     snapshot_id = save_snapshot(kpi, route_metrics, station_metrics)
                     if snapshot_id:
+                        # Save segment data
+                        if segment_analysis:
+                            save_segment_data(snapshot_id, segment_analysis)
+                        
+                        # Log cascade events every 5 minutes if significant
+                        if time.time() - last_cascade_log > 300:
+                            for corridor_id, cdata in cascade_status.items():
+                                save_cascade_event(corridor_id, cdata)
+                            last_cascade_log = time.time()
+                        
                         logger.info(f"#{snapshot_id}: {len(trains)} trains, OEE={kpi['oee']:.1f}%")
             
             # Weather fetch (every 15 min)
@@ -801,8 +1123,8 @@ collector_thread.start()
 def home():
     return jsonify({
         "status": "running",
-        "service": "Amtrak Collector v5.0",
-        "features": ["time_analysis", "weather", "incidents", "stations", "routes"],
+        "service": "Amtrak Collector v6.0",
+        "features": ["time_analysis", "weather", "incidents", "stations", "routes", "cascade_predictor", "segment_analysis"],
         "database": "connected" if DATABASE_URL else "not configured",
         "weather_api": "configured" if OPENWEATHER_API_KEY else "not configured"
     })
@@ -1346,6 +1668,177 @@ def export_csv():
                 }
     except Exception as e:
         return str(e), 500
+
+
+# =============================================================================
+# CASCADE & SEGMENT API ENDPOINTS
+# =============================================================================
+
+@app.route("/api/cascade/status")
+def get_cascade_status():
+    """Get current cascade risk for all corridors."""
+    cascade = latest_cache.get("cascade", {})
+    if not cascade:
+        trains = latest_cache.get("trains", [])
+        if trains:
+            cascade = analyze_cascade_risk(trains)
+    
+    total_risk = sum(c["risk_score"] for c in cascade.values()) / max(len(cascade), 1) if cascade else 0
+    critical_corridors = [c["name"] for c in cascade.values() if c.get("risk_level") == "critical"]
+    high_risk = [c["name"] for c in cascade.values() if c.get("risk_level") == "high"]
+    
+    return jsonify({
+        "timestamp": latest_cache.get("timestamp"),
+        "network_stress": round(total_risk, 1),
+        "network_status": "critical" if total_risk >= 70 else "stressed" if total_risk >= 40 else "normal",
+        "critical_corridors": critical_corridors,
+        "high_risk_corridors": high_risk,
+        "corridors": cascade
+    })
+
+
+@app.route("/api/cascade/history")
+def get_cascade_history():
+    """Get cascade event history."""
+    hours = request.args.get("hours", 24, type=int)
+    corridor = request.args.get("corridor", None)
+    
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                if corridor:
+                    cur.execute("""
+                        SELECT * FROM cascade_events 
+                        WHERE timestamp > NOW() - INTERVAL '%s hours' AND corridor = %s
+                        ORDER BY timestamp DESC
+                    """, (hours, corridor))
+                else:
+                    cur.execute("""
+                        SELECT * FROM cascade_events 
+                        WHERE timestamp > NOW() - INTERVAL '%s hours'
+                        ORDER BY timestamp DESC
+                    """, (hours,))
+                
+                rows = cur.fetchall()
+                for r in rows:
+                    r["timestamp"] = r["timestamp"].isoformat()
+                return jsonify({"events": rows, "total": len(rows)})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/segments/current")
+def get_segments_current():
+    """Get current segment analysis."""
+    segments = latest_cache.get("segments", [])
+    if not segments:
+        trains = latest_cache.get("trains", [])
+        if trains:
+            segments = analyze_segments(trains)
+    
+    bottlenecks = [s for s in segments if s.get("is_bottleneck")]
+    
+    return jsonify({
+        "timestamp": latest_cache.get("timestamp"),
+        "segments": segments,
+        "bottlenecks": bottlenecks,
+        "bottleneck_count": len(bottlenecks)
+    })
+
+
+@app.route("/api/segments/rankings")
+def get_segment_rankings():
+    """Get segment performance rankings over time."""
+    days = request.args.get("days", 7, type=int)
+    
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute("""
+                    SELECT 
+                        corridor, segment,
+                        COUNT(*) as sample_count,
+                        ROUND(AVG(avg_speed)::numeric, 1) as avg_speed,
+                        ROUND(MIN(avg_speed)::numeric, 1) as min_speed,
+                        ROUND(AVG(avg_delay)::numeric, 1) as avg_delay,
+                        ROUND(AVG(speed_score)::numeric, 1) as avg_score,
+                        ROUND(AVG(CASE WHEN is_bottleneck THEN 100 ELSE 0 END)::numeric, 1) as bottleneck_pct
+                    FROM segment_snapshots s
+                    JOIN kpi_snapshots k ON s.snapshot_id = k.id
+                    WHERE k.timestamp > NOW() - INTERVAL '%s days'
+                    GROUP BY corridor, segment
+                    ORDER BY avg_speed ASC
+                """, (days,))
+                
+                rows = cur.fetchall()
+                
+                for r in rows:
+                    r["corridor_name"] = CORRIDORS.get(r["corridor"], {}).get("name", r["corridor"])
+                
+                worst = [r for r in rows if r["avg_speed"] and r["avg_speed"] < 40][:10]
+                best = sorted([r for r in rows if r["avg_speed"]], key=lambda x: x["avg_speed"], reverse=True)[:10]
+                
+                return jsonify({
+                    "all_segments": rows,
+                    "worst_bottlenecks": worst,
+                    "best_performing": best,
+                    "period_days": days
+                })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/segments/corridor/<corridor_id>")
+def get_corridor_segments(corridor_id):
+    """Get segment details for a specific corridor."""
+    days = request.args.get("days", 7, type=int)
+    
+    if corridor_id not in CORRIDORS:
+        return jsonify({"error": "Unknown corridor"}), 404
+    
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute("""
+                    SELECT 
+                        segment,
+                        date_trunc('hour', k.timestamp) as hour,
+                        COUNT(*) as samples,
+                        ROUND(AVG(avg_speed)::numeric, 1) as avg_speed,
+                        ROUND(AVG(avg_delay)::numeric, 1) as avg_delay
+                    FROM segment_snapshots s
+                    JOIN kpi_snapshots k ON s.snapshot_id = k.id
+                    WHERE corridor = %s AND k.timestamp > NOW() - INTERVAL '%s days'
+                    GROUP BY segment, date_trunc('hour', k.timestamp)
+                    ORDER BY segment, hour
+                """, (corridor_id, days))
+                
+                rows = cur.fetchall()
+                for r in rows:
+                    r["hour"] = r["hour"].isoformat()
+                
+                return jsonify({
+                    "corridor": corridor_id,
+                    "corridor_name": CORRIDORS[corridor_id]["name"],
+                    "segments": CORRIDORS[corridor_id]["segments"],
+                    "data": rows
+                })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/corridors")
+def get_corridors():
+    """Get list of all corridors and their segments."""
+    result = {}
+    for cid, cdata in CORRIDORS.items():
+        result[cid] = {
+            "name": cdata["name"],
+            "routes": cdata["routes"],
+            "segment_count": len(cdata["segments"]),
+            "segments": [s["name"] for s in cdata["segments"]]
+        }
+    return jsonify(result)
 
 
 if __name__ == "__main__":
