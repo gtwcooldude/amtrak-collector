@@ -1,10 +1,10 @@
 """
-Amtrak Real-Time Data Collector for Railway.app
+Amtrak Real-Time Data Collector with PostgreSQL
 ================================================
 Collects train data from Amtraker API every 30 seconds
-Stores historical KPI snapshots for dashboard retrieval
+Stores historical KPI snapshots in PostgreSQL for months of data
 
-Deploy this to Railway.app for 24/7 data collection.
+Deploy to Railway.app with PostgreSQL addon for permanent storage.
 """
 
 import os
@@ -16,7 +16,9 @@ from datetime import datetime, timedelta
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 import requests
-from collections import deque
+import psycopg2
+from psycopg2.extras import RealDictCursor
+from contextlib import contextmanager
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -28,19 +30,203 @@ CORS(app, resources={r"/*": {"origins": "*"}})
 # Configuration
 AMTRAKER_API = "https://api-v3.amtraker.com/v3"
 COLLECTION_INTERVAL = 30  # seconds
-MAX_SNAPSHOTS = 2880  # 24 hours of data at 30-second intervals
 
-# In-memory storage (for Railway's free tier without persistent storage)
-# For production, use PostgreSQL or Redis
-data_store = {
-    "latest": None,
-    "snapshots": deque(maxlen=MAX_SNAPSHOTS),
-    "stats": {
-        "total_records": 0,
-        "collection_started": None,
-        "last_collection": None
-    }
+# Database URL from Railway
+DATABASE_URL = os.environ.get("DATABASE_URL")
+
+# In-memory cache for latest data (fast access)
+latest_cache = {
+    "trains": [],
+    "timestamp": None,
+    "kpi": None
 }
+
+# =============================================================================
+# DATABASE FUNCTIONS
+# =============================================================================
+
+@contextmanager
+def get_db_connection():
+    """Get database connection with automatic cleanup."""
+    conn = None
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        yield conn
+    finally:
+        if conn:
+            conn.close()
+
+def init_database():
+    """Initialize PostgreSQL tables."""
+    if not DATABASE_URL:
+        logger.error("DATABASE_URL not set!")
+        return False
+    
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                # KPI Snapshots table - stores metrics every 30 seconds
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS kpi_snapshots (
+                        id SERIAL PRIMARY KEY,
+                        timestamp TIMESTAMPTZ DEFAULT NOW(),
+                        total_trains INTEGER,
+                        moving INTEGER,
+                        stopped INTEGER,
+                        delayed INTEGER,
+                        avg_speed FLOAT,
+                        max_speed FLOAT,
+                        oee FLOAT,
+                        on_time_pct FLOAT
+                    )
+                """)
+                
+                # Train positions table - stores individual train data
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS train_positions (
+                        id SERIAL PRIMARY KEY,
+                        snapshot_id INTEGER REFERENCES kpi_snapshots(id),
+                        train_num VARCHAR(20),
+                        route_name VARCHAR(100),
+                        latitude FLOAT,
+                        longitude FLOAT,
+                        speed FLOAT,
+                        delay INTEGER,
+                        origin VARCHAR(100),
+                        destination VARCHAR(100),
+                        status VARCHAR(50)
+                    )
+                """)
+                
+                # Index for faster queries
+                cur.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_kpi_timestamp 
+                    ON kpi_snapshots(timestamp DESC)
+                """)
+                
+                cur.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_train_snapshot 
+                    ON train_positions(snapshot_id)
+                """)
+                
+                conn.commit()
+                logger.info("Database initialized successfully")
+                return True
+    except Exception as e:
+        logger.error(f"Database init error: {e}")
+        return False
+
+def save_snapshot(kpi, trains):
+    """Save KPI snapshot and train positions to database."""
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                # Insert KPI snapshot
+                cur.execute("""
+                    INSERT INTO kpi_snapshots 
+                    (total_trains, moving, stopped, delayed, avg_speed, max_speed, oee, on_time_pct)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    RETURNING id
+                """, (
+                    kpi["total_trains"],
+                    kpi["moving"],
+                    kpi["stopped"],
+                    kpi["delayed"],
+                    kpi["avg_speed"],
+                    kpi["max_speed"],
+                    kpi["oee"],
+                    kpi["on_time_pct"]
+                ))
+                snapshot_id = cur.fetchone()[0]
+                
+                # Insert train positions (sample every 10th train to save space)
+                for i, train in enumerate(trains):
+                    if i % 10 == 0:  # Store 10% of trains to save DB space
+                        cur.execute("""
+                            INSERT INTO train_positions
+                            (snapshot_id, train_num, route_name, latitude, longitude, speed, delay, origin, destination, status)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        """, (
+                            snapshot_id,
+                            train.get("trainNum", ""),
+                            train.get("routeName", ""),
+                            train.get("latitude", 0),
+                            train.get("longitude", 0),
+                            train.get("speed", 0),
+                            train.get("delay", 0),
+                            train.get("origin", ""),
+                            train.get("destination", ""),
+                            train.get("status", "")
+                        ))
+                
+                conn.commit()
+                return snapshot_id
+    except Exception as e:
+        logger.error(f"Save snapshot error: {e}")
+        return None
+
+def get_snapshots(limit=100, hours=None, days=None):
+    """Retrieve historical snapshots from database."""
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                if days:
+                    cur.execute("""
+                        SELECT * FROM kpi_snapshots 
+                        WHERE timestamp > NOW() - INTERVAL '%s days'
+                        ORDER BY timestamp ASC
+                    """, (days,))
+                elif hours:
+                    cur.execute("""
+                        SELECT * FROM kpi_snapshots 
+                        WHERE timestamp > NOW() - INTERVAL '%s hours'
+                        ORDER BY timestamp ASC
+                    """, (hours,))
+                else:
+                    cur.execute("""
+                        SELECT * FROM kpi_snapshots 
+                        ORDER BY timestamp DESC
+                        LIMIT %s
+                    """, (limit,))
+                
+                rows = cur.fetchall()
+                return [dict(row) for row in rows]
+    except Exception as e:
+        logger.error(f"Get snapshots error: {e}")
+        return []
+
+def get_stats():
+    """Get database statistics."""
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("SELECT COUNT(*) as total FROM kpi_snapshots")
+                total = cur.fetchone()["total"]
+                
+                cur.execute("SELECT MIN(timestamp) as first, MAX(timestamp) as last FROM kpi_snapshots")
+                times = cur.fetchone()
+                
+                cur.execute("""
+                    SELECT COUNT(*) as today FROM kpi_snapshots 
+                    WHERE timestamp > NOW() - INTERVAL '24 hours'
+                """)
+                today = cur.fetchone()["today"]
+                
+                return {
+                    "total_snapshots": total,
+                    "snapshots_today": today,
+                    "first_record": times["first"].isoformat() if times["first"] else None,
+                    "last_record": times["last"].isoformat() if times["last"] else None,
+                    "collection_interval": COLLECTION_INTERVAL,
+                    "database": "PostgreSQL"
+                }
+    except Exception as e:
+        logger.error(f"Get stats error: {e}")
+        return {"error": str(e)}
+
+# =============================================================================
+# DATA COLLECTION
+# =============================================================================
 
 def calculate_kpi(trains):
     """Calculate KPI metrics from train data."""
@@ -56,8 +242,7 @@ def calculate_kpi(trains):
     stopped = len(trains) - moving
     delayed = sum(1 for d in delays if d > 0)
     
-    # OEE calculation (simplified)
-    target_speed = 55  # mph
+    target_speed = 55
     oee = min((avg_speed / target_speed) * 100, 100) if avg_speed > 0 else 0
     
     return {
@@ -115,28 +300,31 @@ def fetch_trains():
 
 def collect_data():
     """Background thread to collect data periodically."""
-    data_store["stats"]["collection_started"] = datetime.utcnow().isoformat()
+    # Wait for database to be ready
+    time.sleep(5)
+    init_database()
     
     while True:
         try:
             trains = fetch_trains()
             
             if trains:
-                # Store latest train positions
-                data_store["latest"] = {
-                    "trains": trains,
-                    "timestamp": datetime.utcnow().isoformat()
-                }
-                
-                # Calculate and store KPI snapshot
                 kpi = calculate_kpi(trains)
-                if kpi:
-                    data_store["snapshots"].append(kpi)
-                    data_store["stats"]["total_records"] += 1
                 
-                data_store["stats"]["last_collection"] = datetime.utcnow().isoformat()
+                # Update in-memory cache
+                latest_cache["trains"] = trains
+                latest_cache["timestamp"] = datetime.utcnow().isoformat()
+                latest_cache["kpi"] = kpi
                 
-                logger.info(f"Collected {len(trains)} trains, {len(data_store['snapshots'])} snapshots stored")
+                # Save to PostgreSQL
+                if kpi and DATABASE_URL:
+                    snapshot_id = save_snapshot(kpi, trains)
+                    if snapshot_id:
+                        logger.info(f"Saved snapshot #{snapshot_id}: {len(trains)} trains, OEE={kpi['oee']:.1f}%")
+                    else:
+                        logger.warning("Failed to save snapshot to database")
+                else:
+                    logger.info(f"Collected {len(trains)} trains (no database)")
         
         except Exception as e:
             logger.error(f"Collection error: {e}")
@@ -157,82 +345,100 @@ def home():
     return jsonify({
         "status": "running",
         "service": "Amtrak Data Collector",
-        "version": "2.0",
+        "version": "3.0 (PostgreSQL)",
+        "database": "connected" if DATABASE_URL else "not configured",
         "endpoints": [
-            "/api/latest",
-            "/api/kpi/snapshots",
-            "/api/kpi/latest",
-            "/api/stats"
+            "GET /api/latest - Current train positions",
+            "GET /api/kpi/latest - Latest KPI metrics",
+            "GET /api/kpi/snapshots?limit=100 - Historical snapshots",
+            "GET /api/kpi/snapshots?hours=24 - Last 24 hours",
+            "GET /api/kpi/snapshots?days=7 - Last 7 days",
+            "GET /api/stats - Collection statistics",
+            "GET /api/export/csv - Export all data as CSV"
         ]
     })
 
 @app.route("/api/latest")
 def get_latest():
     """Get latest train positions."""
-    if data_store["latest"]:
-        return jsonify(data_store["latest"])
-    return jsonify({"trains": [], "timestamp": None})
+    return jsonify({
+        "trains": latest_cache["trains"],
+        "timestamp": latest_cache["timestamp"]
+    })
 
 @app.route("/api/kpi/latest")
 def get_latest_kpi():
     """Get latest KPI snapshot."""
-    if data_store["snapshots"]:
-        return jsonify(data_store["snapshots"][-1])
-    return jsonify({})
+    return jsonify(latest_cache["kpi"] or {})
 
 @app.route("/api/kpi/snapshots")
-def get_snapshots():
+def api_get_snapshots():
     """Get historical KPI snapshots."""
     limit = request.args.get("limit", 100, type=int)
     hours = request.args.get("hours", None, type=int)
+    days = request.args.get("days", None, type=int)
     
-    snapshots = list(data_store["snapshots"])
+    snapshots = get_snapshots(limit=limit, hours=hours, days=days)
     
-    # Filter by hours if specified
-    if hours:
-        cutoff = datetime.utcnow() - timedelta(hours=hours)
-        snapshots = [
-            s for s in snapshots 
-            if datetime.fromisoformat(s["timestamp"]) > cutoff
-        ]
+    # Convert timestamps to ISO format strings
+    for s in snapshots:
+        if s.get("timestamp"):
+            s["timestamp"] = s["timestamp"].isoformat()
     
-    # Return most recent snapshots up to limit
     return jsonify({
-        "snapshots": snapshots[-limit:],
+        "snapshots": snapshots,
         "total": len(snapshots),
         "collection_interval": COLLECTION_INTERVAL
     })
 
 @app.route("/api/stats")
-def get_stats():
+def api_get_stats():
     """Get collection statistics."""
-    return jsonify({
-        **data_store["stats"],
-        "snapshots_stored": len(data_store["snapshots"]),
-        "max_snapshots": MAX_SNAPSHOTS,
-        "collection_interval": COLLECTION_INTERVAL
-    })
+    return jsonify(get_stats())
 
 @app.route("/api/routes")
 def get_routes():
     """Get unique routes from current trains."""
-    if not data_store["latest"]:
-        return jsonify([])
-    
     routes = {}
-    for train in data_store["latest"]["trains"]:
+    for train in latest_cache["trains"]:
         name = train.get("routeName", "Unknown")
         if name not in routes:
-            routes[name] = {"name": name, "count": 0, "speeds": []}
+            routes[name] = {"name": name, "count": 0, "speeds": [], "delays": []}
         routes[name]["count"] += 1
         routes[name]["speeds"].append(train.get("speed", 0))
+        routes[name]["delays"].append(train.get("delay", 0))
     
-    # Calculate average speeds
     for route in routes.values():
         route["avg_speed"] = round(sum(route["speeds"]) / len(route["speeds"]), 2) if route["speeds"] else 0
+        route["avg_delay"] = round(sum(route["delays"]) / len(route["delays"]), 2) if route["delays"] else 0
         del route["speeds"]
+        del route["delays"]
     
     return jsonify(list(routes.values()))
+
+@app.route("/api/export/csv")
+def export_csv():
+    """Export all KPI data as CSV."""
+    days = request.args.get("days", 30, type=int)
+    snapshots = get_snapshots(days=days)
+    
+    if not snapshots:
+        return "No data available", 404
+    
+    # Build CSV
+    headers = ["timestamp", "total_trains", "moving", "stopped", "delayed", "avg_speed", "max_speed", "oee", "on_time_pct"]
+    lines = [",".join(headers)]
+    
+    for s in snapshots:
+        row = [str(s.get(h, "")) for h in headers]
+        lines.append(",".join(row))
+    
+    csv_content = "\n".join(lines)
+    
+    return csv_content, 200, {
+        "Content-Type": "text/csv",
+        "Content-Disposition": f"attachment; filename=amtrak_kpi_{days}days.csv"
+    }
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
