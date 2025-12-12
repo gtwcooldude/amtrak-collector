@@ -4,7 +4,7 @@ Amtrak Real-Time Data Collector with PostgreSQL
 Collects train data from Amtraker API every 30 seconds
 Stores historical KPI snapshots in PostgreSQL for months of data
 
-Deploy to Railway.app with PostgreSQL addon for permanent storage.
+Uses psycopg3 for Python 3.13 compatibility.
 """
 
 import os
@@ -16,8 +16,8 @@ from datetime import datetime, timedelta
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 import requests
-import psycopg2
-from psycopg2.extras import RealDictCursor
+import psycopg
+from psycopg.rows import dict_row
 from contextlib import contextmanager
 
 # Configure logging
@@ -50,7 +50,7 @@ def get_db_connection():
     """Get database connection with automatic cleanup."""
     conn = None
     try:
-        conn = psycopg2.connect(DATABASE_URL)
+        conn = psycopg.connect(DATABASE_URL)
         yield conn
     finally:
         if conn:
@@ -169,7 +169,7 @@ def get_snapshots(limit=100, hours=None, days=None):
     """Retrieve historical snapshots from database."""
     try:
         with get_db_connection() as conn:
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            with conn.cursor(row_factory=dict_row) as cur:
                 if days:
                     cur.execute("""
                         SELECT * FROM kpi_snapshots 
@@ -199,7 +199,7 @@ def get_stats():
     """Get database statistics."""
     try:
         with get_db_connection() as conn:
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            with conn.cursor(row_factory=dict_row) as cur:
                 cur.execute("SELECT COUNT(*) as total FROM kpi_snapshots")
                 total = cur.fetchone()["total"]
                 
@@ -345,7 +345,7 @@ def home():
     return jsonify({
         "status": "running",
         "service": "Amtrak Data Collector",
-        "version": "3.0 (PostgreSQL)",
+        "version": "3.0 (PostgreSQL + psycopg3)",
         "database": "connected" if DATABASE_URL else "not configured",
         "endpoints": [
             "GET /api/latest - Current train positions",
